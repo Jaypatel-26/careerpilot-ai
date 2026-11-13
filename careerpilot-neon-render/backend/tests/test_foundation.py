@@ -130,3 +130,61 @@ def test_migration_upgrade_downgrade(tmp_path):
     env = dict(os.environ, DATABASE_URL=f"sqlite:///{tmp_path / 'migration.db'}")
     for direction in [('upgrade','head'),('downgrade','base'),('upgrade','head')]:
         subprocess.run([sys.executable,'-m','alembic',*direction], cwd=backend, env=env, check=True, capture_output=True)
+
+
+def test_account_profiles_are_private_persistent_and_validated(client):
+    a, b = signup(client), signup(client, 'two@example.com')
+    h1, h2 = auth(a), auth(b)
+    assert client.get('/api/v1/profile').status_code == 401
+    assert client.patch('/api/v1/profile', json={}).status_code == 401
+    initial = client.get('/api/v1/profile', headers=h1)
+    assert initial.status_code == 200
+    assert initial.headers['cache-control'] == 'no-store'
+    assert initial.json()['full_name'] == 'Test User'
+    assert initial.json()['skills'] == ''
+    draft = client.post('/api/v1/interviews', headers=h1, json=PAYLOAD).json()
+    fields = {'full_name':'  New Name  ', 'target_role':'Engineer', 'experience_level':'Experienced', 'skills':'Python, SQL', 'career_goals':'Build useful things'}
+    saved = client.patch('/api/v1/profile', headers=h1, json=fields)
+    assert saved.status_code == 200
+    assert saved.json()['full_name'] == 'New Name'
+    assert client.get('/api/v1/auth/me', headers=h1).json()['full_name'] == 'New Name'
+    assert client.get('/api/v1/profile', headers=h2).json()['skills'] == ''
+    assert client.patch('/api/v1/profile', headers=h2, json={**fields, 'id': a.json()['user']['id']}).status_code == 422
+    for invalid in ({**fields, 'full_name':'   '}, {**fields, 'experience_level':'Expert'}, {**fields, 'skills':'x'*2001}, {**fields, 'email':'takeover@example.com'}):
+        assert client.patch('/api/v1/profile', headers=h1, json=invalid).status_code == 422
+    assert client.get('/api/v1/interviews/'+draft['id'], headers=h1).status_code == 200
+    assert client.post('/api/v1/auth/logout', headers=h1).status_code == 204
+    assert client.get('/api/v1/profile', headers=h1).status_code == 401
+    again = client.post('/api/v1/auth/login', json={'email':'one@example.com', 'password':'correct-horse-battery'})
+    assert client.get('/api/v1/profile', headers=auth(again)).json()['career_goals'] == 'Build useful things'
+
+
+def test_profile_preflight_allows_patch(client):
+    response = client.options('/api/v1/profile', headers={'Origin': 'http://localhost:5173', 'Access-Control-Request-Method': 'PATCH', 'Access-Control-Request-Headers': 'authorization,content-type'})
+    assert response.status_code == 200
+    assert 'PATCH' in response.headers['access-control-allow-methods']
+
+
+def test_profile_migration_preserves_existing_accounts_and_drafts(tmp_path):
+    from sqlalchemy import text
+    backend = Path(__file__).resolve().parents[1]
+    url = f"sqlite:///{tmp_path / 'preserve.db'}"
+    env = dict(os.environ, DATABASE_URL=url)
+    def migrate(*args):
+        subprocess.run([sys.executable, '-m', 'alembic', *args], cwd=backend, env=env, check=True, capture_output=True)
+    migrate('upgrade', '4d2e9a1b8c10')
+    engine = create_engine(url)
+    uid, sid = uuid4().hex, uuid4().hex
+    with engine.begin() as db:
+        db.execute(text("INSERT INTO users (id,email,full_name,password_hash,created_at) VALUES (:id,'old@example.com','Existing User','hash','2025-01-01')"), {'id':uid})
+        # Insert a saved draft using the real pre-migration schema.
+        columns = db.execute(text('PRAGMA table_info(interview_sessions)')).fetchall()
+        # Use existing ORM defaults against the old schema for an accurately shaped row.
+        print_columns = {c[1] for c in columns}
+        assert {'id', 'user_id', 'target_role'} <= print_columns
+        db.execute(text("INSERT INTO interview_sessions (id,user_id,target_role,interview_type,difficulty,question_count,status,created_at,updated_at) VALUES (:id,:uid,'Saved Role','technical','beginner',3,'draft','2025-01-01','2025-01-01')"), {'id':sid,'uid':uid})
+    migrate('upgrade', 'head')
+    with engine.connect() as db:
+        assert db.execute(text('SELECT full_name, skills FROM users WHERE id=:id'), {'id':uid}).one() == ('Existing User', None)
+        assert db.execute(text('SELECT target_role FROM interview_sessions WHERE id=:id'), {'id':sid}).scalar_one() == 'Saved Role'
+    engine.dispose()
